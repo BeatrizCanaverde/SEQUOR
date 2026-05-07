@@ -1,0 +1,181 @@
+#!/bin/bash
+
+set -e
+
+run_dir={{ run_dir }}
+testset_dir={{ testset_dir }}
+output_dir={{ output_dir }}
+log_dir={{ log_dir }}
+judge_dir={{ judge_dir }}
+
+port=$(shuf -i 20000-64000 -n 1)
+dist_port=$((port + 1))
+dist_init_addr=localhost:${dist_port}
+
+api_base_url=http://localhost:${port}/v1
+api_model={{ model_path }}
+api_key={{ api_key }}
+max_turns={{ max_turns }}
+max_tokens={{ max_tokens }}
+
+health_check_max_wait_minutes={{ health_check_max_wait_minutes }}
+health_check_interval_seconds={{ health_check_interval_seconds }}
+
+set -e
+
+log() {
+   local level="$1"
+   local message="$2"
+   echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message"
+}
+
+INFERENCE_SERVER_PID=""
+
+cleanup() {
+    if [ -n "$INFERENCE_SERVER_PID" ]; then
+        log "INFO" "Cleaning up inference server with PID $INFERENCE_SERVER_PID"
+        # Send SIGTERM first (graceful shutdown)
+        kill -TERM "$INFERENCE_SERVER_PID" 2>/dev/null || true
+        
+        # Wait up to 30 seconds for graceful shutdown
+        local wait_count=0
+        while kill -0 "$INFERENCE_SERVER_PID" 2>/dev/null && [ $wait_count -lt 30 ]; do
+            sleep 1
+            wait_count=$((wait_count + 1))
+        done
+        
+        # If still running, force kill
+        if kill -0 "$INFERENCE_SERVER_PID" 2>/dev/null; then
+            log "WARN" "Server did not shut down gracefully, forcing kill"
+            kill -KILL "$INFERENCE_SERVER_PID" 2>/dev/null || true
+        fi
+        
+        log "INFO" "Inference server cleaned up"
+    fi
+}
+
+trap cleanup SIGUSR1 SIGTERM SIGINT EXIT
+
+
+set -x
+
+# Set a custom workspace directory for flashinfer to avoid permission issues
+# Use /tmp which is always writable
+export FLASHINFER_WORKSPACE_DIR="/tmp/flashinfer_workspace_$$"
+mkdir -p "$FLASHINFER_WORKSPACE_DIR"
+log "INFO" "FlashInfer workspace set to: $FLASHINFER_WORKSPACE_DIR"
+
+# Point to the CUDA stubs so the JIT compiler can find libcuda.so
+# Often located in /usr/local/cuda/lib64/stubs
+export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64/stubs
+# Also helpful to ensure the server sees the GPU libraries at runtime
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64/stubs
+log "INFO" "python path: $(which python)"
+
+sglang_common_args=(
+  --model-path "${api_model}"
+  --host 0.0.0.0
+  --context-length {{ context_length }}
+  --mem-fraction-static 0.9 # 7  # baixar se necessario
+  --cuda-graph-max-bs 128    # 16 para gemma; baixar se necessario
+)
+
+server_launch_cmd=(python3 -m sglang.launch_server "${sglang_common_args[@]}" \
+  --log-level warning --host 0.0.0.0 --port "${port}" --tp {{ tp_size }} --dp {{ dp_size }})
+
+# Start inference server (local)
+log "INFO" "Starting inference server"
+"${server_launch_cmd[@]}" > "${log_dir}/$$-inference-server.log" 2>&1 &
+
+# # SGlang common args
+# sglang_common_args=(
+#     --model-path "${api_model}"
+#     --host 0.0.0.0
+#     --context-length 65536
+#     --mem-fraction-static 0.7  # baixar se necessario
+#     --cuda-graph-max-bs 128  # 16 para gemma; baixar se necessario
+# )
+
+# server_launch_cmd="python3 -m sglang.launch_server "${sglang_common_args[@]}" --log-level warning --host 0.0.0.0 --port ${port} --dist-init-addr ${dist_init_addr} --tp {{ tp_size }}"
+
+# Start inference server (local)
+# log "INFO" "Starting inference server"
+# $server_launch_cmd > "${log_dir}/$$-inference-server.log" 2>&1 &
+INFERENCE_SERVER_PID=$!
+
+# Give the inference server srun command time to actually start
+sleep 5
+
+# Wait for inference server to become healthy
+wait_for_api_server() {
+    local max_attempts=$((health_check_max_wait_minutes * 60 / health_check_interval_seconds))  # Calculate attempts based on total time and interval
+    log "INFO" "Maximum health check wait time: ${health_check_max_wait_minutes} minutes"
+    local attempt=0
+    local health_url="${api_base_url}/health"
+    
+    while [ $attempt -lt $max_attempts ]; do
+        log "INFO" "Health check attempt $((attempt + 1))/${max_attempts} for ${health_url}"
+
+        # Check if server process is still alive
+        if ! kill -0 "$INFERENCE_SERVER_PID" 2>/dev/null; then
+            log "ERROR" "Inference server process (PID $INFERENCE_SERVER_PID) has died"
+            log "ERROR" "Check the server log for details: ${log_dir}/$$-inference-server.log"
+            return 1
+        fi
+
+        if curl -s --connect-timeout 5 --max-time 10 "${health_url}" >/dev/null 2>&1; then
+            log "INFO" "Inference server is healthy and ready!"
+            return 0
+        fi
+
+        log "INFO" "Inference server not ready, waiting ${health_check_interval_seconds} seconds..."
+        sleep ${health_check_interval_seconds}
+        attempt=$((attempt + 1))
+    done
+    
+    log "ERROR" "Error: inference server did not become healthy within timeout"
+    return 1
+}
+log "INFO" "Waiting for inference server to become healthy"
+wait_for_api_server
+HEALTHCHECK_EXIT_CODE=$?
+
+# If health check failed, exit immediately
+if [ $HEALTHCHECK_EXIT_CODE -ne 0 ]; then
+    log "ERROR" "Health check failed. Exiting job to prevent resource waste."
+    log "ERROR" "health_check_failed" "Inference server did not become healthy within timeout"
+    exit 1
+fi
+
+# Run inference
+log "INFO" "Running inference"
+# Start inference in a new process group so we can kill the entire group
+cli_args=""
+cli_args+=" --testset_dir ${testset_dir}"
+cli_args+=" --run_dir ${run_dir}"
+cli_args+=" --output_dir ${output_dir}"
+cli_args+=" --api_url ${api_base_url}"
+cli_args+=" --api_model ${api_model}"
+cli_args+=" --api_key ${api_key}"
+cli_args+=" --max_turns ${max_turns}"
+cli_args+=" --max_tokens ${max_tokens}"
+cli_args+=" --batch_size {{ batch_size }}"
+cli_args+=" --max_concurrent {{ max_concurrent }}"
+
+
+python multi_if/cli.py evaluate $cli_args \
+    > "${log_dir}/$$-inference.log" 2>&1 &
+    
+INFERENCE_PID=$!
+wait $INFERENCE_PID
+INFERENCE_EXIT_CODE=$?
+
+if [ $INFERENCE_EXIT_CODE -eq 0 ]; then
+    log "INFO" "Inference completed successfully, recording shard completion"
+    log "INFO" "Done"
+    exit 0
+else
+    log "ERROR" "Inference failed with exit code $INFERENCE_EXIT_CODE"
+    log "ERROR" "inference_script_failed" "run_inference.py exited with code $INFERENCE_EXIT_CODE"
+    exit 1
+fi

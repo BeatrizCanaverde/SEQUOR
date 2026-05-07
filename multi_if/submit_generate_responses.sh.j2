@@ -1,0 +1,232 @@
+#!/bin/bash
+
+set -e
+
+run_dir={{ run_dir }}
+testset_dir={{ testset_dir }}
+log_dir={{ log_dir }}
+chat_dir={{ chat_dir }}
+
+port=$(shuf -i 20000-64000 -n 1)
+dist_port=$((port + 1))
+dist_init_addr=localhost:${dist_port}
+
+{% if api_url -%}
+api_base_url={{ api_url }}
+{% else -%}
+api_base_url=http://localhost:${port}/v1
+{% endif -%}
+api_model={{ model_path }}
+api_key={{ api_key }}
+max_turns={{ max_turns }}
+max_tokens={{ max_tokens }}
+
+health_check_max_wait_minutes={{ health_check_max_wait_minutes }}
+health_check_interval_seconds={{ health_check_interval_seconds }}
+
+set -e
+
+log() {
+   local level="$1"
+   local message="$2"
+   echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message"
+}
+
+INFERENCE_SERVER_PID=""
+INFERENCE_PID=""
+CLEANUP_DONE=0
+
+cleanup() {
+    # Prevent duplicate cleanup calls
+    if [ "$CLEANUP_DONE" -eq 1 ]; then
+        return 0
+    fi
+    CLEANUP_DONE=1
+    
+    log "INFO" "Cleanup triggered"
+    
+    # Kill inference client if running
+    if [ -n "$INFERENCE_PID" ]; then
+        log "INFO" "Cleaning up inference client with PID $INFERENCE_PID"
+        kill -TERM "$INFERENCE_PID" 2>/dev/null || true
+        # Wait briefly for graceful shutdown
+        sleep 2
+        kill -KILL "$INFERENCE_PID" 2>/dev/null || true
+    fi
+    
+    # Kill inference server if running
+    if [ -n "$INFERENCE_SERVER_PID" ]; then
+        log "INFO" "Cleaning up inference server with PID $INFERENCE_SERVER_PID"
+        kill -TERM "$INFERENCE_SERVER_PID" 2>/dev/null || true
+        # Wait briefly for graceful shutdown
+        sleep 2
+        kill -KILL "$INFERENCE_SERVER_PID" 2>/dev/null || true
+    fi
+}
+
+handle_sigterm() {
+    log "WARN" "Received SIGTERM (likely time limit). Cleaning up and exiting."
+    cleanup
+    exit 143  # Standard exit code for SIGTERM (128 + 15)
+}
+
+trap cleanup EXIT
+trap handle_sigterm SIGTERM SIGINT SIGUSR1
+
+
+set -x
+
+# Point to the CUDA libraries so the JIT compiler can find libcuda.so
+# LIBRARY_PATH is used at link time, LD_LIBRARY_PATH at runtime
+export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+log "INFO" "python path: $(which python)"
+
+# If api_url is provided, we skip local server startup
+{% if not api_url %}
+# Validate model path exists
+if [ ! -d "${api_model}" ]; then
+    log "ERROR" "Model path does not exist: ${api_model}"
+    log "ERROR" "Please check the --job.model_path argument"
+    exit 1
+fi
+
+log "INFO" "Model path validated: ${api_model}"
+
+# Validate testset directory exists
+if [ ! -d "${testset_dir}" ]; then
+    log "ERROR" "Testset directory does not exist: ${testset_dir}"
+    log "ERROR" "Please check the --job.testset_dir argument"
+    exit 1
+fi
+
+log "INFO" "Testset directory validated: ${testset_dir}"
+
+sglang_common_args=(
+  --model-path "${api_model}"
+  --host 0.0.0.0
+  --context-length {{ context_length }}
+  --mem-fraction-static 0.9  # baixar se necessario
+  --cuda-graph-max-bs 128    # 16 para gemma; baixar se necessario
+  --trust-remote-code
+)
+
+server_launch_cmd=(python3 -m sglang.launch_server "${sglang_common_args[@]}" \
+  --log-level warning --host 0.0.0.0 --port "${port}" --tp {{ tp_size }} --dp {{ dp_size }})
+
+# Start inference server (local)
+log "INFO" "Starting inference server"
+"${server_launch_cmd[@]}" > "${log_dir}/$$-inference-server.log" 2>&1 &
+
+# # SGlang common args
+# sglang_common_args=(
+#     --model-path "${api_model}"
+#     --host 0.0.0.0
+#     --context-length 65536
+#     --mem-fraction-static 0.7  # baixar se necessario
+#     --cuda-graph-max-bs 128  # 16 para gemma; baixar se necessario
+# )
+
+# server_launch_cmd="python3 -m sglang.launch_server "${sglang_common_args[@]}" --log-level warning --host 0.0.0.0 --port ${port} --dist-init-addr ${dist_init_addr} --tp {{ tp_size }}"
+
+# Start inference server (local)
+# log "INFO" "Starting inference server"
+# $server_launch_cmd > "${log_dir}/$$-inference-server.log" 2>&1 &
+INFERENCE_SERVER_PID=$!
+
+# Give the inference server srun command time to actually start
+sleep 5
+
+# Check if server process is still alive after initial startup
+if ! kill -0 "$INFERENCE_SERVER_PID" 2>/dev/null; then
+    log "ERROR" "Inference server process died immediately after startup"
+    log "ERROR" "This usually indicates a configuration error (e.g., invalid model path)"
+    log "ERROR" "Check the server log for details: ${log_dir}/$$-inference-server.log"
+    exit 1
+fi
+
+# Wait for inference server to become healthy
+wait_for_api_server() {
+    local max_attempts=$((health_check_max_wait_minutes * 60 / health_check_interval_seconds))  # Calculate attempts based on total time and interval
+    log "INFO" "Maximum health check wait time: ${health_check_max_wait_minutes} minutes"
+    local attempt=0
+    local health_url="${api_base_url}/health"
+    
+    while [ $attempt -lt $max_attempts ]; do
+        log "INFO" "Health check attempt $((attempt + 1))/${max_attempts} for ${health_url}"
+
+        # Check if server process is still alive
+        if ! kill -0 "$INFERENCE_SERVER_PID" 2>/dev/null; then
+            log "ERROR" "Inference server process has died during startup"
+            log "ERROR" "Check the server log for details: ${log_dir}/$$-inference-server.log"
+            return 1
+        fi
+
+        if curl -s --connect-timeout 5 --max-time 10 "${health_url}" >/dev/null 2>&1; then
+            log "INFO" "Inference server is healthy and ready!"
+            return 0
+        fi
+
+        log "INFO" "Inference server not ready, waiting ${health_check_interval_seconds} seconds..."
+        sleep ${health_check_interval_seconds}
+        attempt=$((attempt + 1))
+    done
+    
+    log "ERROR" "Error: inference server did not become healthy within timeout"
+    log "ERROR" "Check the server log for details: ${log_dir}/$$-inference-server.log"
+    return 1
+}
+log "INFO" "Waiting for inference server to become healthy"
+wait_for_api_server
+HEALTHCHECK_EXIT_CODE=$?
+
+# If health check failed, exit immediately
+if [ $HEALTHCHECK_EXIT_CODE -ne 0 ]; then
+    log "ERROR" "Health check failed. Exiting job to prevent resource waste."
+    log "ERROR" "health_check_failed" "Inference server did not become healthy within timeout"
+    exit 1
+fi
+{% else %}
+log "INFO" "Using external API URL: ${api_base_url}. Skipping local server startup."
+{% endif %}
+
+# Run inference
+log "INFO" "Running inference"
+# Start inference in a new process group so we can kill the entire group
+cli_args=""
+cli_args+=" --testset_dir ${testset_dir}"
+cli_args+=" --run_dir ${run_dir}"
+cli_args+=" --api_url ${api_base_url}"
+cli_args+=" --api_model ${api_model}"
+cli_args+=" --api_key ${api_key}"
+cli_args+=" --output_dir ${chat_dir}"
+cli_args+=" --max_turns ${max_turns}"
+cli_args+=" --max_tokens ${max_tokens}"
+cli_args+=" --batch_size {{ batch_size }}"
+cli_args+=" --max_concurrent {{ max_concurrent }}"
+
+
+python multi_if/cli.py generate_responses $cli_args \
+    > "${log_dir}/$$-inference.log" 2>&1 &
+    
+INFERENCE_PID=$!
+log "INFO" "Inference process started with PID $INFERENCE_PID"
+
+# Wait for inference to complete
+# The wait will be interrupted if we receive SIGTERM
+wait $INFERENCE_PID
+INFERENCE_EXIT_CODE=$?
+
+# Check if process was killed (exit codes > 128 indicate signal termination)
+if [ $INFERENCE_EXIT_CODE -gt 128 ]; then
+    log "WARN" "Inference process was terminated by signal (exit code: $INFERENCE_EXIT_CODE)"
+    exit $INFERENCE_EXIT_CODE
+elif [ $INFERENCE_EXIT_CODE -eq 0 ]; then
+    log "INFO" "Inference completed successfully"
+    log "INFO" "Done"
+    exit 0
+else
+    log "ERROR" "Inference failed with exit code $INFERENCE_EXIT_CODE"
+    log "ERROR" "Check the inference log for details: ${log_dir}/$$-inference.log"
+    exit 1
+fi
