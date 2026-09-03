@@ -1,0 +1,172 @@
+:root {
+  --paper: #edf1f1;
+  --ink: #10181a;
+  --muted: #55676a;
+  --accent: #0e7a82;
+  --accent-soft: #dcf0ee;
+  --border: #d3dedd;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0d1315;
+    --ink: #eaf2f1;
+    --muted: #93a6a5;
+    --accent: #4fd1c5;
+    --accent-soft: rgba(79, 209, 197, 0.14);
+    --border: #223032;
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper: #0d1315;
+  --ink: #eaf2f1;
+  --muted: #93a6a5;
+  --accent: #4fd1c5;
+  --accent-soft: rgba(79, 209, 197, 0.14);
+  --border: #223032;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  display: flex;
+  justify-content: center;
+  padding: 15vh 24px 48px;
+}
+
+.page {
+  width: 100%;
+  max-width: 460px;
+}
+
+.eyebrow {
+  margin: 0 0 18px;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+h1 {
+  margin: 0;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 44px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  text-wrap: balance;
+}
+
+.subtitle {
+  margin: 14px 0 0;
+  max-width: 34ch;
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.links {
+  margin-top: 44px;
+  border-top: 1px solid var(--border);
+}
+
+.row {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 20px 4px 20px 14px;
+  border-bottom: 1px solid var(--border);
+  border-left: 2px solid transparent;
+  text-decoration: none;
+  color: var(--ink);
+  transition: border-left-color 0.12s ease, background 0.12s ease, padding-left 0.12s ease;
+}
+
+.row:hover,
+.row:focus-visible {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  padding-left: 20px;
+  outline: none;
+}
+
+.glyph {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 15px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.row-label {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.row-title {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.badge {
+  margin-left: auto;
+  align-self: center;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+
+.foot {
+  margin-top: 32px;
+}
+
+.foot p {
+  margin: 0;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.foot a {
+  color: var(--muted);
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+
+.foot a:hover {
+  color: var(--accent);
+  text-decoration-color: var(--accent);
+}
+
+@media (max-width: 420px) {
+  body { padding-top: 10vh; }
+  h1 { font-size: 36px; }
+}
